@@ -23,18 +23,34 @@ export class PropertyPage extends BasePage {
       .first();
   }
 
+  /** The booking panel: the smallest block holding both "Check-In" and "Promo code". */
+  private bookingPanel(): Locator {
+    return this.page
+      .locator('div')
+      .filter({ has: this.page.getByText(/^\s*Check-In\s*$/i) })
+      .filter({ has: this.page.getByText(/promo code/i) })
+      .last();
+  }
+
+  /** Short dump of visible page text, so a failure tells us what the page really showed. */
+  private async describeState(): Promise<string> {
+    const body = (await this.page.locator('body').innerText().catch(() => '')).replace(/\s+/g, ' ');
+    const at = body.search(/check-in/i);
+    const snippet = at >= 0 ? body.slice(Math.max(0, at - 40), at + 700) : body.slice(0, 700);
+    const buttons = (await this.page.getByRole('button').filter({ visible: true }).allInnerTexts().catch(() => []))
+      .map((t) => t.trim())
+      .filter(Boolean)
+      .slice(0, 25);
+    return `URL: ${this.page.url()}\nVisible buttons: ${JSON.stringify(buttons)}\nPage text: ${snippet}`;
+  }
+
   /**
    * The Guests trigger is not a <p>. Find it inside the booking panel (the
    * smallest block holding both "Check-In" and "Promo code"), by its
    * "Guests" label. Fall back to the "1 Adult" summary text.
    */
   private guestsTrigger(): Locator {
-    const panel = this.page
-      .locator('div')
-      .filter({ has: this.page.getByText(/^\s*Check-In\s*$/i) })
-      .filter({ has: this.page.getByText(/promo code/i) })
-      .last();
-    return panel
+    return this.bookingPanel()
       .getByText(/^\s*guests?\s*$/i)
       .filter({ visible: true })
       .first()
@@ -57,7 +73,11 @@ export class PropertyPage extends BasePage {
     if (await opener.isVisible().catch(() => false)) {
       await this.safeClick(opener);
     }
-    await label.waitFor({ state: 'visible', timeout: 8_000 }).catch(() => {});
+    try {
+      await label.waitFor({ state: 'visible', timeout: 8_000 });
+    } catch {
+      throw new Error(`Booking panel (Check-In) is not visible on this layout.\n${await this.describeState()}`);
+    }
   }
 
   async openCheckInPicker() {
@@ -71,15 +91,29 @@ export class PropertyPage extends BasePage {
     await this.safeClick(this.panelLabel('Check-Out'));
   }
 
+  /**
+   * The value shown under a panel label ("Check-In" / "Check-Out") is a
+   * <p class="selected-date"> that reads DD/MM/YYYY until a date is chosen.
+   */
+  private async expectDateFieldSet(label: 'Check-In' | 'Check-Out') {
+    const value = this.panelLabel(label).locator('xpath=following-sibling::p[1]');
+    await expect(value, `${label} date was not set (placeholder still shown)`).not.toHaveText(
+      /DD\/MM\/YYYY/i,
+      { timeout: 10_000 }
+    );
+  }
+
   /** Opens Check-In, picks the start day, then picks the end day (opening Check-Out if needed). */
   async selectStayDates(startIndex = 2, nights = 3) {
     await this.openCheckInPicker();
     const startLabel = await this.pickStartDay(startIndex);
+    await this.expectDateFieldSet('Check-In');
     await this.page.waitForTimeout(500);
     if ((await this.dayCells().count()) === 0) {
       await this.openCheckOutPicker();
     }
     await this.pickEndDay(startLabel, nights);
+    await this.expectDateFieldSet('Check-Out');
   }
 
   async openGuestsSelector() {
@@ -110,6 +144,17 @@ export class PropertyPage extends BasePage {
     }
   }
 
+  /** After changing dates/guests the panel may need a Search/Update click before the price refreshes. */
+  async clickSearchIfPresent() {
+    const search = this.bookingPanel()
+      .getByRole('button', { name: /search|update|check availability|get price|get quote/i })
+      .filter({ visible: true });
+    if ((await search.count()) > 0) {
+      await this.safeClick(search.first());
+      await this.page.waitForTimeout(1000);
+    }
+  }
+
   async enterPromoCode(code: string) {
     await this.dismissCookieBanner();
     await this.page.getByPlaceholder(/enter your code here/i).fill(code);
@@ -117,7 +162,11 @@ export class PropertyPage extends BasePage {
 
   async getTotalPrice(): Promise<string> {
     const total = this.page.getByText(/total for \d+ nights?/i).filter({ visible: true }).first();
-    await total.waitFor({ state: 'visible', timeout: 15_000 });
+    try {
+      await total.waitFor({ state: 'visible', timeout: 15_000 });
+    } catch {
+      throw new Error(`"Total for N nights" price not shown.\n${await this.describeState()}`);
+    }
     return (await total.locator('xpath=..').innerText()).trim();
   }
 

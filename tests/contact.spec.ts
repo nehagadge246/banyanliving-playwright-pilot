@@ -11,6 +11,13 @@ test.describe('Contact form @regression', () => {
       message: 'Automated pilot run - please disregard.',
     });
     await contact.acceptTermsIfPresent();
+
+    // The live staging form requires Google reCAPTCHA. It must be completed
+    // by a human/test environment service; the pilot does not bypass it.
+    if (await contact.hasHumanVerification()) {
+      test.skip(true, 'Staging contact form requires human reCAPTCHA verification.');
+    }
+
     await contact.submit();
     await contact.expectSubmitted();
   });
