@@ -1,0 +1,17 @@
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+
+# Playwright reports
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+
+# TypeScript build output
+dist/
+*.tsbuildinfo
