@@ -69,12 +69,11 @@ export class BasePage {
   }
 
   /**
-   * Only the day cells whose centre is inside the viewport. The page can hold
-   * other pre-rendered calendars (header search, mobile drawer) that are
-   * "visible" to Playwright but sit off-screen; clicking those does nothing.
-   * The calendar the user just opened is always on screen.
+   * Enabled day cells with their on-screen flag. A page can hold several
+   * calendars (header search, drawers), so cells currently inside the viewport
+   * are preferred; Playwright scrolls to the others when it clicks them.
    */
-  protected async onScreenDayCells(): Promise<{ cell: Locator; label: string }[]> {
+  protected async dayCellInfo(): Promise<{ cell: Locator; label: string; onScreen: boolean }[]> {
     const cells = this.dayCells();
     const info = await cells.evaluateAll((els) =>
       els.map((el, index) => {
@@ -88,20 +87,28 @@ export class BasePage {
         };
       })
     );
-    return info.filter((i) => i.onScreen).map((i) => ({ cell: cells.nth(i.index), label: i.label }));
+    return info.map((i) => ({ cell: cells.nth(i.index), label: i.label, onScreen: i.onScreen }));
   }
 
+  /** Same as dayCellInfo but only the on-screen cells. */
+  protected async onScreenDayCells(): Promise<{ cell: Locator; label: string }[]> {
+    return (await this.dayCellInfo()).filter((i) => i.onScreen);
+  }
+
+  /**
+   * Waits for an open calendar. On-screen cells win; if none appear within a
+   * couple of seconds (calendar opens below the fold) all enabled cells are used.
+   */
   protected async waitForOnScreenDayCells(timeout = 10_000) {
-    const deadline = Date.now() + timeout;
-    while (Date.now() < deadline) {
-      const found = await this.onScreenDayCells();
-      if (found.length > 0) return found;
+    const started = Date.now();
+    while (Date.now() - started < timeout) {
+      const info = await this.dayCellInfo();
+      const onScreen = info.filter((i) => i.onScreen);
+      if (onScreen.length > 0) return onScreen;
+      if (info.length > 0 && Date.now() - started > 2_000) return info;
       await this.page.waitForTimeout(250);
     }
-    const total = await this.dayCells().count();
-    throw new Error(
-      `No enabled day cells are on screen (${total} found on the page in total). The calendar did not open.`
-    );
+    throw new Error('No enabled day cells found. The calendar did not open.');
   }
 
   /** Clicks the Nth on-screen enabled day cell and returns its day number as text. */

@@ -91,29 +91,42 @@ export class PropertyPage extends BasePage {
     await this.safeClick(this.panelLabel('Check-Out'));
   }
 
-  /**
-   * The value shown under a panel label ("Check-In" / "Check-Out") is a
-   * <p class="selected-date"> that reads DD/MM/YYYY until a date is chosen.
-   */
-  private async expectDateFieldSet(label: 'Check-In' | 'Check-Out') {
-    const value = this.panelLabel(label).locator('xpath=following-sibling::p[1]');
-    await expect(value, `${label} date was not set (placeholder still shown)`).not.toHaveText(
-      /DD\/MM\/YYYY/i,
-      { timeout: 10_000 }
-    );
+  /** Text shown under a panel label; a <p class="selected-date"> that reads DD/MM/YYYY until set. */
+  private dateValue(label: 'Check-In' | 'Check-Out'): Locator {
+    return this.panelLabel(label).locator('xpath=following-sibling::p[1]');
   }
 
-  /** Opens Check-In, picks the start day, then picks the end day (opening Check-Out if needed). */
+  private async expectDatesApplied() {
+    try {
+      for (const label of ['Check-In', 'Check-Out'] as const) {
+        await expect(this.dateValue(label), `${label} date was not set`).not.toHaveText(/DD\/MM\/YYYY/i, {
+          timeout: 10_000,
+        });
+      }
+    } catch (error) {
+      const values = await this.page.locator('p.selected-date').allInnerTexts().catch(() => []);
+      const onScreen = (await this.onScreenDayCells().catch(() => [])).length;
+      throw new Error(
+        `${(error as Error).message}\nselected-date texts: ${JSON.stringify(values)}\n` +
+          `on-screen day cells still open: ${onScreen}`
+      );
+    }
+  }
+
+  /**
+   * Opens Check-In, picks the start day, then the end day (opening Check-Out if
+   * the calendar closed). The panel only shows the dates once the range is
+   * complete, so both are verified at the end.
+   */
   async selectStayDates(startIndex = 2, nights = 3) {
     await this.openCheckInPicker();
     const startLabel = await this.pickStartDay(startIndex);
-    await this.expectDateFieldSet('Check-In');
     await this.page.waitForTimeout(500);
-    if ((await this.dayCells().count()) === 0) {
+    if ((await this.onScreenDayCells()).length === 0) {
       await this.openCheckOutPicker();
     }
     await this.pickEndDay(startLabel, nights);
-    await this.expectDateFieldSet('Check-Out');
+    await this.expectDatesApplied();
   }
 
   async openGuestsSelector() {
