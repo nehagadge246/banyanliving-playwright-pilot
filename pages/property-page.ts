@@ -23,6 +23,40 @@ export class PropertyPage extends BasePage {
       .first();
   }
 
+  /** Every Check-In (or Check-Out) label on the page, duplicates included, in DOM order. */
+  private allPanelLabels(text: 'Check-In' | 'Check-Out'): Locator {
+    return this.page.locator('p').filter({ hasText: new RegExp(`^\\s*${text}\\s*$`, 'i') });
+  }
+
+  /** The <p class="selected-date"> value that follows a given Check-In/Check-Out label. */
+  private dateValueAt(text: 'Check-In' | 'Check-Out', index: number): Locator {
+    return this.allPanelLabels(text).nth(index).locator('xpath=following-sibling::p[1]');
+  }
+
+  /**
+   * The page has more than one Check-In control (a known duplicate-widget
+   * pattern on this site). Rather than guess which is "the real one", try
+   * each in turn and keep the first that actually opens a calendar. Reading
+   * the date back from that exact same element afterwards is then guaranteed
+   * to match what was clicked, regardless of DOM order.
+   */
+  private async findWorkingCheckInIndex(): Promise<number> {
+    const labels = this.allPanelLabels('Check-In');
+    const count = await labels.count();
+    if (count === 0) {
+      throw new Error('No "Check-In" label found on the page at all.');
+    }
+    for (let i = 0; i < count; i++) {
+      await this.dismissCookieBanner();
+      await this.safeClick(labels.nth(i));
+      await this.page.waitForTimeout(400);
+      if ((await this.dayCellInfo()).length > 0) return i;
+      await this.page.keyboard.press('Escape').catch(() => {});
+      await this.page.waitForTimeout(200);
+    }
+    throw new Error(`None of the ${count} "Check-In" control(s) on the page opened a calendar.`);
+  }
+
   /** The booking panel: the smallest block holding both "Check-In" and "Promo code". */
   private bookingPanel(): Locator {
     return this.page
@@ -58,75 +92,33 @@ export class PropertyPage extends BasePage {
       .first();
   }
 
-  /**
-   * On narrower layouts (tablet) the booking panel is hidden behind a sticky
-   * bar button. If Check-In is not visible, open the panel through that button.
-   */
-  async ensureBookingPanelOpen() {
-    const label = this.panelLabel('Check-In');
-    if (await label.isVisible().catch(() => false)) return;
-
-    const opener = this.page
-      .getByRole('button', { name: /book now|check availability|reserve|select dates/i })
-      .filter({ visible: true })
-      .last();
-    if (await opener.isVisible().catch(() => false)) {
-      await this.safeClick(opener);
-    }
-    try {
-      await label.waitFor({ state: 'visible', timeout: 8_000 });
-    } catch {
-      throw new Error(`Booking panel (Check-In) is not visible on this layout.\n${await this.describeState()}`);
-    }
-  }
-
-  async openCheckInPicker() {
-    await this.dismissCookieBanner();
-    await this.ensureBookingPanelOpen();
-    await this.safeClick(this.panelLabel('Check-In'));
-  }
-
-  async openCheckOutPicker() {
-    await this.dismissCookieBanner();
-    await this.safeClick(this.panelLabel('Check-Out'));
-  }
-
   /** Text shown under a panel label; a <p class="selected-date"> that reads DD/MM/YYYY until set. */
-  private dateValue(label: 'Check-In' | 'Check-Out'): Locator {
-    return this.panelLabel(label).locator('xpath=following-sibling::p[1]');
-  }
-
-  private async expectDatesApplied() {
-    try {
-      for (const label of ['Check-In', 'Check-Out'] as const) {
-        await expect(this.dateValue(label), `${label} date was not set`).not.toHaveText(/DD\/MM\/YYYY/i, {
-          timeout: 10_000,
-        });
-      }
-    } catch (error) {
-      const values = await this.page.locator('p.selected-date').allInnerTexts().catch(() => []);
-      const onScreen = (await this.onScreenDayCells().catch(() => [])).length;
-      throw new Error(
-        `${(error as Error).message}\nselected-date texts: ${JSON.stringify(values)}\n` +
-          `on-screen day cells still open: ${onScreen}`
-      );
-    }
+  private async expectDateValueSet(text: 'Check-In' | 'Check-Out', index: number) {
+    await expect(this.dateValueAt(text, index), `${text} date was not set`).not.toHaveText(
+      /DD\/MM\/YYYY/i,
+      { timeout: 10_000 }
+    );
   }
 
   /**
-   * Opens Check-In, picks the start day, then the end day (opening Check-Out if
-   * the calendar closed). The panel only shows the dates once the range is
-   * complete, so both are verified at the end.
+   * Finds a working Check-In control, picks a start day, opens the matching
+   * Check-Out control (same index) if the calendar closed after check-in,
+   * picks the end day, then verifies both dates changed at that same index.
    */
   async selectStayDates(startIndex = 2, nights = 3) {
-    await this.openCheckInPicker();
+    const index = await this.findWorkingCheckInIndex();
     const startLabel = await this.pickStartDay(startIndex);
     await this.page.waitForTimeout(500);
+
     if ((await this.onScreenDayCells()).length === 0) {
-      await this.openCheckOutPicker();
+      await this.dismissCookieBanner();
+      await this.safeClick(this.allPanelLabels('Check-Out').nth(index));
+      await this.page.waitForTimeout(400);
     }
     await this.pickEndDay(startLabel, nights);
-    await this.expectDatesApplied();
+
+    await this.expectDateValueSet('Check-In', index);
+    await this.expectDateValueSet('Check-Out', index);
   }
 
   async openGuestsSelector() {
