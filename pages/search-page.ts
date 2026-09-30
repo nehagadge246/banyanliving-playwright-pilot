@@ -75,6 +75,35 @@ export class SearchPage extends BasePage {
     ).toBeEnabled();
   }
 
+  /**
+   * The home page's "Where" search box offers an autocomplete of matching
+   * properties/locations. There are 2 elements matching this field: a
+   * readonly decoy (tabindex="-1") and the real editable input - exclude
+   * readonly explicitly, since a plain visibility filter doesn't catch it.
+   */
+  private whereInput(): Locator {
+    return this.page
+      .locator('input[placeholder="Where"]:not([readonly])')
+      .filter({ visible: true })
+      .first();
+  }
+
+  async searchPropertyByName(name: string) {
+    await this.dismissCookieBanner();
+    const input = this.whereInput();
+    await this.safeClick(input);
+    await input.fill(name);
+    await this.safeClick(
+      this.page.getByRole('button', { name: new RegExp(name, 'i') }).filter({ visible: true }).first()
+    );
+    // Selecting the suggestion may only fill the field rather than navigate
+    // immediately - if a Search button exists, use it to actually go there.
+    const searchButton = this.page.getByRole('button', { name: /^search$/i }).filter({ visible: true });
+    if ((await searchButton.count()) > 0) {
+      await this.safeClick(searchButton.first());
+    }
+  }
+
   /** Clicks the first property card/link on the current listing page. */
   async openFirstProperty() {
     await this.dismissCookieBanner();

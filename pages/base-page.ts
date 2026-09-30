@@ -38,27 +38,11 @@ export class BasePage {
     } catch {
       /* fall through */
     }
-    try {
-      await locator.evaluate((el) => el.scrollIntoView({ block: 'center', inline: 'center' }), undefined, {
-        timeout,
-      });
-      const box = await locator.boundingBox();
-      const viewport = this.page.viewportSize();
-      if (
-        box &&
-        viewport &&
-        box.x >= 0 &&
-        box.y >= 0 &&
-        box.x + box.width <= viewport.width &&
-        box.y + box.height <= viewport.height
-      ) {
-        await this.page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-        return;
-      }
-    } catch {
-      /* fall through */
-    }
-    await locator.dispatchEvent('click', {}, { timeout });
+    // force: true performs a real click at the element's location, bypassing
+    // Playwright's own actionability checks (visibility/stability) that can
+    // misfire on animated or overlapping widgets. This is a genuine click,
+    // unlike dispatchEvent, which can silently no-op on some frameworks.
+    await locator.click({ timeout, force: true });
   }
 
   /** Enabled, rendered day cells (plain-digit buttons) anywhere on the page. */
@@ -74,7 +58,12 @@ export class BasePage {
    * are preferred; Playwright scrolls to the others when it clicks them.
    */
   protected async dayCellInfo(): Promise<{ cell: Locator; label: string; onScreen: boolean }[]> {
-    const cells = this.dayCells();
+    // If a popover/dialog holding a calendar is open, use only its cells; otherwise every enabled cell.
+    const inPopover = this.page
+      .locator('[data-radix-popper-content-wrapper], [role="dialog"]')
+      .getByRole('button', { name: /^\d{1,2}$/, disabled: false })
+      .filter({ visible: true });
+    const cells = (await inPopover.count()) > 0 ? inPopover : this.dayCells();
     const info = await cells.evaluateAll((els) =>
       els.map((el, index) => {
         const r = el.getBoundingClientRect();
