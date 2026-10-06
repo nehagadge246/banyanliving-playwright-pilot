@@ -88,20 +88,89 @@ export class SearchPage extends BasePage {
       .first();
   }
 
+  private async reachedPropertyPage(timeout: number): Promise<boolean> {
+    return this.page
+      .waitForURL(/\/property\//, { timeout })
+      .then(() => true)
+      .catch(() => false);
+  }
+
+  /**
+   * Types the name into "Where", picks the matching suggestion, and ends up on
+   * the property page. The old version assumed the suggestion is a <button> and
+   * that selecting it (plus an optional Search click) lands on /property/. If the
+   * suggestion is another role, or Search leads to a listing instead, the test
+   * only failed 15s later with a bare waitForURL timeout. This version:
+   *   1. looks for the suggestion inside the dropdown first (so a same-named card
+   *      elsewhere on the page cannot match), then falls back to option/button/link;
+   *   2. checks whether selecting it navigated straight to /property/;
+   *   3. otherwise clicks Search and checks again;
+   *   4. otherwise, if a listing is shown, opens the card whose text matches the name;
+   *   5. fails with the URL and what was found, so "property no longer exists on
+   *      staging" is distinguishable from "locator is wrong".
+   */
   async searchPropertyByName(name: string) {
     await this.dismissCookieBanner();
     const input = this.whereInput();
     await this.safeClick(input);
     await input.fill(name);
-    await this.safeClick(
-      this.page.getByRole('button', { name: new RegExp(name, 'i') }).filter({ visible: true }).first()
-    );
+
+    const nameRe = new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    const suggestionCandidates: Locator[] = [
+      this.page
+        .locator('[role="listbox"], [role="dialog"], [data-radix-popper-content-wrapper], [cmdk-list]')
+        .getByText(nameRe)
+        .filter({ visible: true })
+        .first(),
+      this.page.getByRole('option', { name: nameRe }).filter({ visible: true }).first(),
+      this.page.getByRole('button', { name: nameRe }).filter({ visible: true }).first(),
+      this.page.getByRole('link', { name: nameRe }).filter({ visible: true }).first(),
+    ];
+
+    let suggestionFound = false;
+    for (const candidate of suggestionCandidates) {
+      try {
+        await candidate.waitFor({ state: 'visible', timeout: 3_000 });
+        await this.safeClick(candidate);
+        suggestionFound = true;
+        break;
+      } catch {
+        /* try the next kind of element */
+      }
+    }
+    if (!suggestionFound) {
+      // No visible suggestion: submit what was typed.
+      await input.press('Enter');
+    }
+
+    if (await this.reachedPropertyPage(5_000)) return;
+
     // Selecting the suggestion may only fill the field rather than navigate
     // immediately - if a Search button exists, use it to actually go there.
     const searchButton = this.page.getByRole('button', { name: /^search$/i }).filter({ visible: true });
     if ((await searchButton.count()) > 0) {
       await this.safeClick(searchButton.first());
+      if (await this.reachedPropertyPage(8_000)) return;
     }
+
+    // Search may land on a results listing - open the card that matches the name.
+    const card = this.page
+      .locator('a[href*="/property/"]')
+      .filter({ hasText: nameRe })
+      .filter({ visible: true })
+      .first();
+    if ((await card.count()) > 0) {
+      await this.safeClick(card);
+      if (await this.reachedPropertyPage(10_000)) return;
+    }
+
+    throw new Error(
+      `Searching for "${name}" did not reach a property page.\n` +
+        `Current URL: ${this.page.url()}\n` +
+        `Suggestion found and clicked: ${suggestionFound}\n` +
+        'Check test-failed-1.png: if the dropdown has no match, the property was renamed/removed on staging ' +
+        '(update the test data); if it has one, the suggestion locator needs adjusting.'
+    );
   }
 
   /** Clicks the first property card/link on the current listing page. */
