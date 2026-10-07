@@ -8,6 +8,36 @@ export type DayCell = {
   clickable: boolean;
 };
 
+/**
+ * Runs INSIDE the page (passed to locator.evaluate, so it must not use anything
+ * from this file). Performs the same event sequence a real mouse click produces -
+ * pointer/mouse over, down, up, then click - directly on the element. Needs no
+ * visibility, stability or hit-target checks, so it still works on controls that
+ * Playwright refuses to click because they never "settle" (animated sheets, calendars
+ * that re-render continuously, as on the tablet layout).
+ */
+function domClickEvents(el: Element) {
+  const target = el as HTMLElement;
+  target.scrollIntoView({ block: 'center', inline: 'center' });
+  const r = target.getBoundingClientRect();
+  const init = {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    clientX: r.left + r.width / 2,
+    clientY: r.top + r.height / 2,
+    button: 0,
+    view: window,
+  };
+  for (const type of ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup']) {
+    const event = type.startsWith('pointer')
+      ? new PointerEvent(type, { ...init, pointerId: 1, pointerType: 'mouse', isPrimary: true })
+      : new MouseEvent(type, init);
+    target.dispatchEvent(event);
+  }
+  target.click();
+}
+
 export class BasePage {
   constructor(protected page: Page) {}
 
@@ -142,7 +172,7 @@ export class BasePage {
     }
 
     try {
-      await locator.evaluate((el) => (el as HTMLElement).click(), undefined, { timeout: 2000 });
+      await locator.evaluate(domClickEvents, undefined, { timeout: 2000 });
     } catch (error) {
       note('DOM click', error);
       throw new Error(`Click failed with every strategy.\n${errors.join('\n')}`);
@@ -184,9 +214,37 @@ export class BasePage {
       .catch(() => 'visible controls unavailable');
   }
 
-  /** Fast variant for calendar cells / arrows: short timeouts, optional `mode: 'dom'`. */
-  protected async activate(locator: Locator, mode: 'auto' | 'dom' = 'auto') {
-    await this.clickWithFallbacks(locator, { first: 1500, rest: 1000 }, mode);
+  /**
+   * Fast click for calendar cells / arrows, bounded to a couple of seconds.
+   *  'auto' (default): a normal click for 0.8s; if Playwright cannot complete it
+   *          (e.g. the element never becomes "stable"), the in-page click events;
+   *  'force': scroll into view, then a forced real mouse click;
+   *  'key'  : focus the element and press Enter;
+   *  'dom'  : the in-page click events only.
+   * The older version walked through five strategies with 1-2s timeouts each, so
+   * one stubborn cell cost 6-8s and a whole date selection could eat the test's
+   * entire time budget.
+   */
+  protected async activate(locator: Locator, mode: 'auto' | 'force' | 'key' | 'dom' = 'auto') {
+    if (mode === 'auto') {
+      try {
+        await locator.click({ timeout: 800 });
+        return;
+      } catch {
+        /* fall through to the in-page events */
+      }
+    }
+    if (mode === 'force') {
+      await locator.scrollIntoViewIfNeeded({ timeout: 1000 }).catch(() => {});
+      await locator.click({ timeout: 1500, force: true });
+      return;
+    }
+    if (mode === 'key') {
+      await locator.focus({ timeout: 1500 });
+      await this.page.keyboard.press('Enter');
+      return;
+    }
+    await locator.evaluate(domClickEvents, undefined, { timeout: 2000 });
   }
 
   /**

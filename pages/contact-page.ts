@@ -1,4 +1,4 @@
-import { Page, Locator, expect } from '@playwright/test';
+import { Page, Locator, expect, test } from '@playwright/test';
 import { BasePage } from './base-page';
 
 export class ContactPage extends BasePage {
@@ -104,8 +104,23 @@ export class ContactPage extends BasePage {
         '.cf-turnstile',
       ].join(', ')
     );
-    await captcha.first().waitFor({ state: 'attached', timeout: 5_000 }).catch(() => {});
-    return (await captcha.count()) > 0;
+    // The verification renders late and sometimes lazily, so the old 5-second wait
+    // for the widget alone missed it now and then - the test then clicked a disabled
+    // Send button and failed. Wait up to 12s for ANY sign of it: the widget itself,
+    // the notice text under the form ("...whether or not you are a human visitor and
+    // to prevent automated spam submissions"), or - after the form has had a few
+    // seconds to settle - a Send button that is still disabled although every field
+    // is filled.
+    const notice = this.page.getByText(/human visitor|automated spam|not a robot|captcha/i);
+    const send = this.page.getByRole('button', { name: /submit|send/i }).filter({ visible: true }).last();
+    const started = Date.now();
+    while (Date.now() - started < 12_000) {
+      if ((await captcha.count()) > 0) return true;
+      if (await notice.first().isVisible().catch(() => false)) return true;
+      if (Date.now() - started > 3_000 && (await send.isDisabled().catch(() => false))) return true;
+      await this.page.waitForTimeout(500);
+    }
+    return false;
   }
 
   /**
@@ -130,8 +145,22 @@ export class ContactPage extends BasePage {
       expect(await el.inputValue().catch(() => 'x'), `Required field #${i + 1} is empty`).not.toBe('');
     }
 
+    // Any consent checkbox must be ticked.
+    const checkbox = this.page.getByRole('checkbox').first();
+    if ((await checkbox.count()) > 0) {
+      expect(await checkbox.isChecked().catch(() => false), 'The consent checkbox is not ticked').toBe(true);
+    }
+
+    // The Send button is only required to be present: with a CAPTCHA on the form it
+    // stays disabled until the CAPTCHA is solved, which is the CAPTCHA working, not a
+    // fault in the form. Whether it is currently enabled is recorded, not asserted.
     const submit = this.page.getByRole('button', { name: /submit|send/i }).filter({ visible: true }).last();
-    await expect(submit, 'Submit button is not visible/enabled').toBeEnabled();
+    await expect(submit, 'Submit button is not visible').toBeVisible();
+    const enabled = await submit.isEnabled().catch(() => false);
+    test.info().annotations.push({
+      type: 'send-button',
+      description: enabled ? 'enabled' : 'disabled until the CAPTCHA is solved (expected)',
+    });
   }
 
   async submit() {

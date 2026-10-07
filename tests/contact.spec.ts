@@ -22,7 +22,7 @@ test.describe('Contact form @regression', () => {
     // To run the real submit, ask the developers to set up the staging form with
     // Google's reCAPTCHA test keys (or switch the CAPTCHA off on staging), then run
     // with BANYAN_CAPTCHA_DISABLED=1.
-    if ((await contact.hasHumanVerification()) && !process.env.BANYAN_CAPTCHA_DISABLED) {
+    if (!process.env.BANYAN_CAPTCHA_DISABLED && (await contact.hasHumanVerification())) {
       await contact.expectReadyToSubmit(DETAILS);
       return;
     }

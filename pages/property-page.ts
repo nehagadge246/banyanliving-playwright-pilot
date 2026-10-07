@@ -10,8 +10,19 @@ export class PropertyPage extends BasePage {
     await this.goto(`/property/${slug}`);
   }
 
+  /**
+   * The control that opens the calendar. Desktop: a single button named
+   * "Check-In DD/MM/YYYY Check-Out". Tablet: a button named
+   * "Dates DD/MM/YYYY - DD/MM/YYYY Edit" (same control, different wording; the
+   * words may or may not be separated by spaces in the accessible name, so no
+   * word boundary is required after "Dates").
+   */
   private datesTrigger(): Locator {
-    return this.page.getByRole('button', { name: /check-in/i }).filter({ visible: true });
+    const checkIn = this.page.getByRole('button', { name: /check-in/i }).filter({ visible: true });
+    const dates = this.page
+      .getByRole('button', { name: /^dates[\s\S]*(dd\/mm\/yyyy|\d{1,2}\/\d{1,2}\/\d{2,4})/i })
+      .filter({ visible: true });
+    return checkIn.or(dates);
   }
 
   /**
@@ -224,12 +235,13 @@ export class PropertyPage extends BasePage {
     const target = before[index];
     const beforeKey = await this.dayStateKey();
 
-    await this.activate(target.cell);
+    await this.activate(target.cell).catch(() => {});
     await this.page.waitForTimeout(500);
     let registered = (await this.dayStateKey()) !== beforeKey;
     if (!registered) {
-      await this.page.waitForTimeout(700);
-      await this.activate(target.cell);
+      // Nothing changed: try ONE different kind of click (a real forced mouse click).
+      await this.page.waitForTimeout(500);
+      await this.activate(target.cell, 'force').catch(() => {});
       await this.page.waitForTimeout(500);
       registered = (await this.dayStateKey()) !== beforeKey;
     }
@@ -252,10 +264,52 @@ export class PropertyPage extends BasePage {
     return n;
   }
 
-  private async applyEnabled(timeout: number): Promise<boolean> {
-    const apply = this.page.getByRole('button', { name: 'Apply' }).filter({ visible: true }).first();
+  /**
+   * The Apply button of the panel that is actually open. On the tablet layout an
+   * Apply button exists on the page even while no panel is open (it sits in a
+   * closed sheet), so "the first visible Apply" can be the wrong one. This picks
+   * the first Apply that is really on screen and not covered, falling back to the
+   * first match.
+   */
+  private async applyButton(scope: 'calendar' | 'any' = 'any'): Promise<Locator> {
+    if (scope === 'calendar') {
+      // The page can hold several Apply buttons (the tablet layout's sheet, the
+      // guests panel). The one that matters for the dates is the one in the same
+      // panel as the day cells: walk up from a visible day cell to the nearest
+      // container that holds an Apply button and tag that button.
+      const tagged = await this.page
+        .evaluate(() => {
+          document.querySelectorAll('[data-pw-apply]').forEach((e) => e.removeAttribute('data-pw-apply'));
+          const day = Array.from(document.querySelectorAll('button')).find(
+            (b) =>
+              /^\d{1,2}$/.test((b.textContent || '').trim()) &&
+              !(b as HTMLButtonElement).disabled &&
+              b.getBoundingClientRect().width > 0
+          );
+          let node: Element | null = day || null;
+          while (node) {
+            const apply = Array.from(node.querySelectorAll('button')).find((b) =>
+              /^\s*apply\s*$/i.test(b.textContent || '')
+            );
+            if (apply) {
+              apply.setAttribute('data-pw-apply', '1');
+              return true;
+            }
+            node = node.parentElement;
+          }
+          return false;
+        })
+        .catch(() => false);
+      if (tagged) return this.page.locator('[data-pw-apply="1"]').first();
+    }
+    return this.firstReachable(this.page.getByRole('button', { name: 'Apply' }).filter({ visible: true }));
+  }
+
+  private async applyEnabled(timeout: number, scope: 'calendar' | 'any' = 'calendar'): Promise<boolean> {
     try {
-      await expect(apply).toBeEnabled({ timeout });
+      await expect
+        .poll(async () => (await this.applyButton(scope)).isEnabled().catch(() => false), { timeout })
+        .toBe(true);
       return true;
     } catch {
       return false;
@@ -264,15 +318,41 @@ export class PropertyPage extends BasePage {
 
   private async clickApply(what: string = 'date range') {
     await this.dismissCookieBanner();
-    const apply = this.page.getByRole('button', { name: 'Apply' }).filter({ visible: true }).first();
+    const scope = what === 'date range' ? 'calendar' : 'any';
     try {
-      await expect(apply, `Apply stayed disabled - the ${what} was not completed`).toBeEnabled({
-        timeout: 8_000,
-      });
+      await expect
+        .poll(async () => (await this.applyButton(scope)).isEnabled().catch(() => false), {
+          timeout: 8_000,
+          message: `Apply stayed disabled - the ${what} was not completed`,
+        })
+        .toBe(true);
     } catch (error) {
       throw new Error(`${(error as Error).message}\n${await this.describeCalendar()}`);
     }
-    await this.safeClick(apply);
+    await this.safeClick(await this.applyButton(scope));
+  }
+
+  /** True once no visible "DD/MM/YYYY" placeholder is left (hidden duplicates of the control are ignored). */
+  private async datesApplied(timeout: number): Promise<boolean> {
+    try {
+      await expect
+        .poll(async () => this.page.getByText('DD/MM/YYYY').filter({ visible: true }).count(), { timeout })
+        .toBe(0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Moment after which date selection gives up with a clear error instead of running into the test timeout. */
+  private deadline = Number.POSITIVE_INFINITY;
+
+  private async assertTimeLeft(log: string[], where: string) {
+    if (Date.now() > this.deadline) {
+      throw new Error(
+        `Date selection ran out of its time budget (${where}).\n  ${log.join('\n  ')}\n${await this.describeCalendar()}`
+      );
+    }
   }
 
   /**
@@ -294,6 +374,7 @@ export class PropertyPage extends BasePage {
     log.push(`check-in: day ${checkIn.label} (list position ${checkIn.index}), click registered: ${checkIn.registered}`);
 
     for (let attempt = 0; attempt <= 6; attempt++) {
+      await this.assertTimeLeft(log, `check-out attempt ${attempt + 1}`);
       if (attempt > 0) {
         const prev = await this.stableCells(1_500);
         const a = this.anchorIndex(prev, checkIn.label, checkIn.index);
@@ -323,10 +404,18 @@ export class PropertyPage extends BasePage {
         log.push(`check-in day ${checkIn.label} not found in the live list; using position ${nights - 1 + attempt}`);
       }
 
-      await this.activate(target.cell);
-      const enabled = await this.applyEnabled(2_500);
-      log.push(`check-out attempt ${attempt + 1}: day ${target.label} (${offset} cells after check-in) -> Apply ${enabled ? 'enabled' : 'disabled'}`);
-      if (enabled) return { ok: true, log };
+      // The first check-out day is tried with every kind of click (a click that did not
+      // register looks the same as a rejected range); later days with the default only.
+      const modes: Array<'auto' | 'force' | 'key'> = attempt === 0 ? ['auto', 'force', 'key'] : ['auto'];
+      for (const mode of modes) {
+        await this.activate(target.cell, mode).catch(() => {});
+        const enabled = await this.applyEnabled(2_500);
+        log.push(
+          `check-out attempt ${attempt + 1}: day ${target.label} (${offset} cells after check-in), ` +
+            `${mode} click -> Apply ${enabled ? 'enabled' : 'disabled'}`
+        );
+        if (enabled) return { ok: true, log };
+      }
     }
     return { ok: false, log };
   }
@@ -339,9 +428,11 @@ export class PropertyPage extends BasePage {
    */
   async selectStayDates(startOffset: number = 2, nights: number = 3) {
     await this.ensureTallViewport();
+    this.deadline = Date.now() + 100_000; // the whole booking test has 150s; leave room for guests, price, Book Now
     const logs: string[] = [];
     for (let pass = 1; pass <= 2; pass++) {
       if (pass === 2) {
+        if (this.deadline - Date.now() < 40_000) break; // too little time left for a clean second pass
         await this.page.reload();
         await this.page.waitForTimeout(1000);
         await this.dismissCookieBanner();
@@ -350,10 +441,15 @@ export class PropertyPage extends BasePage {
       logs.push(`pass ${pass}:\n  ${result.log.join('\n  ')}`);
       if (result.ok) {
         await this.clickApply();
-        await expect(
-          this.page.getByText('DD/MM/YYYY'),
-          'Dates were not applied (placeholder still shown)'
-        ).toHaveCount(0, { timeout: 10_000 });
+        if (!(await this.datesApplied(6_000))) {
+          // The Apply click may not have registered: press it once more before failing.
+          await this.activate(await this.applyButton('calendar'), 'dom').catch(() => {});
+          if (!(await this.datesApplied(6_000))) {
+            throw new Error(
+              `Dates were not applied (the DD/MM/YYYY placeholder is still shown).\n${await this.describeCalendar()}`
+            );
+          }
+        }
         return;
       }
     }
@@ -366,11 +462,42 @@ export class PropertyPage extends BasePage {
   // Guests, price, booking
   // ---------------------------------------------------------------------------
 
+  private async guestsPanelOpen(timeout: number): Promise<boolean> {
+    return this.page
+      .getByRole('button', { name: 'Increase value' })
+      .filter({ visible: true })
+      .first()
+      .waitFor({ state: 'visible', timeout })
+      .then(() => true)
+      .catch(() => false);
+  }
+
+  /**
+   * Desktop: click the "Adults" text. If that does not open the guests panel (the
+   * tablet layout shows the guests row with a separate "Edit" button), press the
+   * plain "Edit" buttons one by one until the panel (its "Increase value" button)
+   * appears. The dates control is named "Dates ... Edit", so it is not matched by
+   * the exact "Edit" name.
+   */
   async openGuestsSelector() {
     await this.dismissCookieBanner();
     const trigger = this.page.getByText(/adults?/i).filter({ visible: true }).last();
-    await this.scrollToUpperViewport(trigger);
-    await this.safeClick(trigger);
+    if ((await trigger.count()) > 0) {
+      await this.scrollToUpperViewport(trigger);
+      await this.safeClick(trigger);
+      if (await this.guestsPanelOpen(2_500)) return;
+    }
+
+    const edits = this.page.getByRole('button', { name: /^edit$/i }).filter({ visible: true });
+    const count = Math.min(await edits.count(), 4);
+    for (let i = 0; i < count; i++) {
+      await this.safeClick(edits.nth(i)).catch(() => {});
+      if (await this.guestsPanelOpen(2_500)) return;
+    }
+    throw new Error(
+      'Could not open the guests selector (no "Increase value" button appeared).\n' +
+        `Visible controls -> ${await this.describeVisibleControls()}`
+    );
   }
 
   async incrementAdults(times: number = 1) {
