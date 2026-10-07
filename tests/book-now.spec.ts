@@ -20,13 +20,6 @@ async function bookFromPropertyPage(property: PropertyPage) {
 }
 
 test.describe('Book Now @regression', () => {
-  // TODO: the property page's booking panel is not reachable on the tablet
-  // layout (the Check-In control isn't rendered/visible at that width) - skip
-  // until someone maps how it opens there.
-  test.beforeEach(({}, testInfo) => {
-    test.skip(testInfo.project.name === 'tablet', 'Property booking panel not mapped on tablet yet');
-  });
-
   test('listing -> property details -> dates/guests -> price -> Book Now', async ({ page }) => {
     const search = new SearchPage(page);
     const property = new PropertyPage(page);

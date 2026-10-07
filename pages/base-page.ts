@@ -153,6 +153,37 @@ export class BasePage {
     await this.clickWithFallbacks(locator, { first: timeout, rest: 2000 });
   }
 
+  /**
+   * Names of the buttons, links and inputs that are actually visible right now.
+   * Appended to errors when a control cannot be found, so a failure at a new
+   * screen size (tablet) shows what that layout really offers instead of just
+   * "not found".
+   */
+  protected async describeVisibleControls(): Promise<string> {
+    return this.page
+      .evaluate(() => {
+        const visible = (el: Element) => {
+          const r = el.getBoundingClientRect();
+          const s = getComputedStyle(el);
+          return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+        };
+        const label = (el: Element) =>
+          (el.getAttribute('aria-label') || el.textContent || el.getAttribute('placeholder') || '')
+            .trim()
+            .replace(/\s+/g, ' ')
+            .slice(0, 40);
+        const pick = (selector: string) =>
+          Array.from(document.querySelectorAll(selector)).filter(visible).map(label).filter(Boolean).slice(0, 30);
+        return (
+          `viewport ${window.innerWidth}x${window.innerHeight}; ` +
+          `buttons: ${JSON.stringify(pick('button, [role="button"]'))}; ` +
+          `links: ${JSON.stringify(pick('a'))}; ` +
+          `inputs: ${JSON.stringify(pick('input, textarea, select'))}`
+        );
+      })
+      .catch(() => 'visible controls unavailable');
+  }
+
   /** Fast variant for calendar cells / arrows: short timeouts, optional `mode: 'dom'`. */
   protected async activate(locator: Locator, mode: 'auto' | 'dom' = 'auto') {
     await this.clickWithFallbacks(locator, { first: 1500, rest: 1000 }, mode);

@@ -5,13 +5,6 @@ import { ReservationPage } from '../pages/reservation-page';
 const PROPERTY_SLUG = 'reef-residences-3-three-bedroom-3b-premium';
 
 test.describe('Reservation page @regression', () => {
-  // TODO: the property page's booking panel is not reachable on the tablet
-  // layout (the Check-In control isn't rendered/visible at that width) - skip
-  // until someone maps how it opens there.
-  test.beforeEach(({}, testInfo) => {
-    test.skip(testInfo.project.name === 'tablet', 'Property booking panel not mapped on tablet yet');
-  });
-
   // This test reaches the /reserve/ page and checks its form and query
   // parameters. It deliberately does NOT submit the reservation - the real
   // "Book now" button on this page creates an actual booking, which a

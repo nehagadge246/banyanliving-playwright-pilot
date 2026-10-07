@@ -88,6 +88,32 @@ export class SearchPage extends BasePage {
       .first();
   }
 
+  /**
+   * On narrower screens (tablet) the "Where" box may be collapsed behind a search
+   * or menu button. On desktop the input is already there and this returns
+   * immediately. Otherwise it presses search/menu openers until the input shows
+   * up, and fails with the list of visible controls if none does.
+   */
+  private async revealWhereSearch() {
+    await this.whereInput().waitFor({ state: 'visible', timeout: 4_000 }).catch(() => {});
+    if ((await this.whereInput().count()) > 0) return;
+
+    const openers = this.page
+      .getByRole('button', { name: /search|where|destination|find|menu/i })
+      .filter({ visible: true });
+    const count = Math.min(await openers.count(), 4);
+    for (let i = 0; i < count; i++) {
+      await this.dismissCookieBanner();
+      await this.safeClick(openers.nth(i)).catch(() => {});
+      await this.page.waitForTimeout(700);
+      if ((await this.whereInput().count()) > 0) return;
+    }
+    throw new Error(
+      'The "Where" search input is not visible at this screen size and no button revealed it.\n' +
+        `Visible controls -> ${await this.describeVisibleControls()}`
+    );
+  }
+
   private async reachedPropertyPage(timeout: number): Promise<boolean> {
     return this.page
       .waitForURL(/\/property\//, { timeout })

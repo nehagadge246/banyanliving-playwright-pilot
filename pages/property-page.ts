@@ -10,26 +10,52 @@ export class PropertyPage extends BasePage {
     await this.goto(`/property/${slug}`);
   }
 
-  /**
-   * The real control is a SINGLE button whose accessible name is literally
-   * "Check-In DD/MM/YYYY Check-Out" before any date is picked, and shows the
-   * applied range afterward. There are separate <p> labels nearby that are
-   * purely decorative and do not reliably reflect this button's state -
-   * verify against this button (or page-wide placeholder text), never a <p>.
-   *
-   * Returns ALL visible matches: the page can contain more than one (sticky
-   * bar, hidden duplicate), so openDatesPicker() picks the one that is really
-   * on screen instead of blindly taking the first.
-   */
   private datesTrigger(): Locator {
     return this.page.getByRole('button', { name: /check-in/i }).filter({ visible: true });
   }
 
+  /**
+   * On narrower screens (tablet) the booking panel is not on the page itself: a
+   * button opens it as a drawer/sheet, so the Check-In control does not exist
+   * until that button is pressed. On desktop the control is already there and this
+   * returns immediately. Otherwise it presses availability/booking openers one by
+   * one until the Check-In control appears (undoing any that navigate away), and
+   * fails with the list of visible controls if none of them does.
+   */
+  private async revealBookingPanel() {
+    await this.datesTrigger().first().waitFor({ state: 'visible', timeout: 4_000 }).catch(() => {});
+    if ((await this.datesTrigger().count()) > 0) return;
+
+    const openerPatterns = [
+      /check availability|select dates|choose dates|add dates|availability|dates/i,
+      /reserve|book|rates|price/i,
+    ];
+    const startUrl = this.page.url();
+    for (const pattern of openerPatterns) {
+      const openers = this.page.getByRole('button', { name: pattern }).filter({ visible: true });
+      const count = Math.min(await openers.count(), 4);
+      for (let i = 0; i < count; i++) {
+        await this.dismissCookieBanner();
+        await this.safeClick(openers.nth(i)).catch(() => {});
+        await this.page.waitForTimeout(700);
+        if (this.page.url() !== startUrl) {
+          await this.page.goBack().catch(() => {});
+          await this.page.waitForTimeout(500);
+          continue;
+        }
+        if ((await this.datesTrigger().count()) > 0) return;
+      }
+    }
+    throw new Error(
+      'The Check-In control is not on the page and no button opened the booking panel at this screen size.\n' +
+        `Visible controls -> ${await this.describeVisibleControls()}`
+    );
+  }
+
   async openDatesPicker() {
     await this.dismissCookieBanner();
+    await this.revealBookingPanel();
     const trigger = await this.firstReachable(this.datesTrigger());
-    // Put the trigger near the TOP of the screen first, so the calendar that opens
-    // below it (with its Apply button at the bottom) fits inside the viewport.
     await this.scrollToUpperViewport(trigger);
     await this.safeClick(trigger);
   }
@@ -38,30 +64,14 @@ export class PropertyPage extends BasePage {
   // Calendar helpers
   // ---------------------------------------------------------------------------
 
-  /**
-   * On some property pages (the first property reached from the listing) the page
-   * does not scroll while the booking calendar is open: in the failing run
-   * scrollY stayed 0 and the inline calendar started at y=1060 in a 1200px-high
-   * window, so every row after the second, later check-out days and the Apply
-   * button below them were permanently off-screen. Scrolling cannot help, so make
-   * the window taller instead. The size stays for the rest of the test (the page
-   * is per-test), which also keeps the guests popover and its Apply button visible.
-   */
   private async ensureTallViewport(minHeight: number = 2000) {
     const size = this.page.viewportSize();
     if (size && size.height < minHeight) {
       await this.page.setViewportSize({ width: size.width, height: minHeight });
-      await this.page.waitForTimeout(300); // let the layout settle after the resize
+      await this.page.waitForTimeout(300);
     }
   }
 
-  /**
-   * Snapshot of ALL enabled day cells in DOM order. Reachability is deliberately
-   * not used to filter here: the failing runs showed cells (and Apply) reported as
-   * "outside of the viewport" even though they were perfectly valid, so filtering
-   * on geometry hid real days and produced wrong check-in/out choices. Clicks go
-   * through activate(), which has keyboard/DOM fallbacks that ignore geometry.
-   */
   private async cells(): Promise<DayCell[]> {
     return this.dayCellInfo();
   }
@@ -81,7 +91,6 @@ export class PropertyPage extends BasePage {
     return cells;
   }
 
-  /** The calendar's "next month" arrow - scoped so a photo-gallery "Next" button can never match. */
   private nextMonthButton(): Locator {
     const byName = this.page.getByRole('button', { name: /next month|go to next/i }).filter({ visible: true });
     const byClass = this.page
@@ -94,12 +103,6 @@ export class PropertyPage extends BasePage {
     return byName.or(byClass).or(inPopover).first();
   }
 
-  /**
-   * Geometry of the first enabled day cell that is off-screen or covered: viewport
-   * size, scroll position, its rectangle, what sits on top of it, and the chain of
-   * ancestors with position/overflow. This is the evidence needed to see WHY a
-   * click is reported as outside the viewport (clipping container, fixed popover...).
-   */
   private async describeGeometry(): Promise<string> {
     return this.page
       .evaluate(() => {
@@ -142,7 +145,6 @@ export class PropertyPage extends BasePage {
       .catch((e) => `geometry unavailable (${(e as Error).message})`);
   }
 
-  /** Human-readable calendar state, appended to errors so a failed run explains itself. */
   private async describeCalendar(): Promise<string> {
     const all = await this.dayCellInfo().catch(() => [] as DayCell[]);
     const apply = this.page.getByRole('button', { name: 'Apply' }).filter({ visible: true }).first();
@@ -162,12 +164,6 @@ export class PropertyPage extends BasePage {
     );
   }
 
-  /**
-   * Makes sure the visible months hold a run of `nights + 1` consecutive
-   * bookable days at/after the preferred check-in. This property's near-term
-   * availability can be genuinely thin (e.g. only 27 and 28 free), so when no
-   * such run exists the calendar is advanced month by month until one does.
-   */
   private async ensureStayWindow(startOffset: number, nights: number, maxMonths = 6) {
     await this.waitForClickableDayCells();
     for (let i = 0; i <= maxMonths; i++) {
@@ -186,45 +182,74 @@ export class PropertyPage extends BasePage {
   }
 
   /**
-   * Clicks the check-in cell, verifying the click registered (the enabled-day
-   * list changes once a check-in is set). The very first click after opening can
-   * be swallowed while the cells settle, and a swallowed click looks identical to
-   * a successful one unless checked. Returns the check-in day number.
+   * Fingerprint of every day button on the page: label, class, aria state and
+   * disabled flag. Clicking a day changes this (selected / range-highlight classes)
+   * even when the SET of enabled days stays the same. The old check ("did the list
+   * of enabled days change?") missed that, so it decided the check-in click had
+   * been swallowed and clicked the SAME day again, up to 3 times - toggling the
+   * selection on and off and leaving the range incomplete.
    */
-  private async clickCheckIn(startOffset: number, nights: number): Promise<number> {
-    const cells = await this.stableCells();
-    const windowStart = this.findStayWindow(cells, startOffset, nights);
-    const target = cells[windowStart >= 0 ? windowStart : Math.min(startOffset, cells.length - 1)];
-    const before = cells.map((c) => c.label).join(',');
-
-    for (let attempt = 0; attempt < 3; attempt++) {
-      // 2nd attempt uses a plain DOM click in case Enter/mouse had no visible effect.
-      await this.activate(target.cell, attempt === 1 ? 'dom' : 'auto');
-      await this.page.waitForTimeout(500);
-      const after = (await this.cells()).map((c) => c.label).join(',');
-      if (after !== before) break; // calendar reacted -> check-in accepted
-    }
-    return Number(target.label);
+  private async dayStateKey(): Promise<string> {
+    return this.page
+      .evaluate(() =>
+        Array.from(document.querySelectorAll('button'))
+          .filter((b) => /^\d{1,2}$/.test((b.textContent || '').trim()))
+          .map((b) =>
+            [
+              (b.textContent || '').trim(),
+              b.getAttribute('class') || '',
+              b.getAttribute('aria-selected') || '',
+              b.getAttribute('aria-pressed') || '',
+              b.getAttribute('data-state') || '',
+              (b as HTMLButtonElement).disabled ? 'd' : 'e',
+            ].join('|')
+          )
+          .join('\n')
+      )
+      .catch(() => '');
   }
 
   /**
-   * Finds the check-out cell `nights` days AFTER the check-in day.
-   * The old code clicked "the Nth enabled cell on the page", which is only
-   * `nights` after check-in when the calendar disables every earlier day; when it
-   * doesn't, it landed 1 night after check-in and Apply stayed disabled.
+   * Clicks a check-in cell and checks that the click registered by comparing the
+   * day-button fingerprint before/after. Only if NOTHING changed (the first click
+   * after opening can be swallowed while the cells settle) is it clicked once more.
    */
-  private async findCheckOut(checkInDay: number, nights: number): Promise<DayCell | undefined> {
-    const cells = await this.stableCells();
-    const wanted = checkInDay + nights;
+  private async clickCheckIn(
+    startOffset: number,
+    nights: number
+  ): Promise<{ label: string; index: number; registered: boolean }> {
+    const before = await this.stableCells();
+    const windowStart = this.findStayWindow(before, startOffset, nights);
+    const index = windowStart >= 0 ? windowStart : Math.min(startOffset, before.length - 1);
+    const target = before[index];
+    const beforeKey = await this.dayStateKey();
 
-    // Prefer a cell that sits exactly `nights` days after the check-in inside one consecutive run.
-    const runStart = cells.findIndex(
-      (c, i) => Number(c.label) === checkInDay && Number(cells[i + nights]?.label) === wanted
-    );
-    if (runStart >= 0) return cells[runStart + nights];
+    await this.activate(target.cell);
+    await this.page.waitForTimeout(500);
+    let registered = (await this.dayStateKey()) !== beforeKey;
+    if (!registered) {
+      await this.page.waitForTimeout(700);
+      await this.activate(target.cell);
+      await this.page.waitForTimeout(500);
+      registered = (await this.dayStateKey()) !== beforeKey;
+    }
+    return { label: target.label, index, registered };
+  }
 
-    // Otherwise any cell carrying the wanted day number.
-    return cells.find((c) => Number(c.label) === wanted);
+  /** Position of the check-in day in the live list (closest to where it was; the same number can appear in two months). */
+  private anchorIndex(live: DayCell[], label: string, expectedIndex: number): number {
+    let best = -1;
+    live.forEach((c, i) => {
+      if (c.label === label && (best < 0 || Math.abs(i - expectedIndex) < Math.abs(best - expectedIndex))) best = i;
+    });
+    return best;
+  }
+
+  /** How many days directly follow `from` as consecutive dates (n, n+1, n+2 ...) with no sold-out gap. */
+  private consecutiveRunLength(live: DayCell[], from: number): number {
+    let n = 0;
+    while (from + n + 1 < live.length && Number(live[from + n + 1].label) === Number(live[from + n].label) + 1) n++;
+    return n;
   }
 
   private async applyEnabled(timeout: number): Promise<boolean> {
@@ -240,10 +265,6 @@ export class PropertyPage extends BasePage {
   private async clickApply(what: string = 'date range') {
     await this.dismissCookieBanner();
     const apply = this.page.getByRole('button', { name: 'Apply' }).filter({ visible: true }).first();
-    // A disabled Apply button means the selection was never actually
-    // completed - clicking it anyway (even with force) hides the real
-    // problem behind a confusing "outside of viewport" error. Fail clearly
-    // here instead, so the real cause (incomplete selection) is obvious.
     try {
       await expect(apply, `Apply stayed disabled - the ${what} was not completed`).toBeEnabled({
         timeout: 8_000,
@@ -255,38 +276,89 @@ export class PropertyPage extends BasePage {
   }
 
   /**
-   * Opens the dates control, makes sure a usable run of days is showing
-   * (advancing months if availability is thin), picks a verified check-in, then
-   * a check-out `nights` days later. If the site enforces a minimum stay, Apply
-   * stays disabled after the first check-out click, so later check-out days are
-   * tried (+1 night at a time) until Apply enables. Then Apply, and verify the
-   * "DD/MM/YYYY" placeholder is gone.
+   * One pass: open the picker, pick a verified check-in, then try check-outs
+   * `nights`, `nights + 1`, ... cells AFTER THE CHECK-IN DAY (never before or on
+   * it). The old positional version indexed the whole list of enabled days, which
+   * still starts at day 7, 8, 9 ... when earlier days stay enabled - so
+   * "position nights-1" was the check-in day itself and it was clicked twice.
+   * The extra attempts cover a minimum-stay rule. After a rejected range the
+   * check-in is clicked again first, so every attempt starts from a known state.
+   * Every step is logged so a failure explains itself.
    */
-  async selectStayDates(startOffset: number = 2, nights: number = 3) {
-    await this.ensureTallViewport();
+  private async tryStayDates(startOffset: number, nights: number): Promise<{ ok: boolean; log: string[] }> {
+    const log: string[] = [];
     await this.openDatesPicker();
     await this.ensureStayWindow(startOffset, nights);
 
-    const checkInDay = await this.clickCheckIn(startOffset, nights);
+    const checkIn = await this.clickCheckIn(startOffset, nights);
+    log.push(`check-in: day ${checkIn.label} (list position ${checkIn.index}), click registered: ${checkIn.registered}`);
 
-    let completed = false;
-    for (let extra = 0; extra <= 4 && !completed; extra++) {
-      const checkOut = await this.findCheckOut(checkInDay, nights + extra);
-      if (!checkOut) break;
-      await this.activate(checkOut.cell);
-      completed = await this.applyEnabled(2_500);
-    }
-    if (!completed) {
-      throw new Error(
-        `Apply stayed disabled - the date range was not completed (check-in day ${checkInDay}, ` +
-          `tried check-outs ${nights}-${nights + 4} nights later).\n${await this.describeCalendar()}`
-      );
-    }
+    for (let attempt = 0; attempt <= 6; attempt++) {
+      if (attempt > 0) {
+        const prev = await this.stableCells(1_500);
+        const a = this.anchorIndex(prev, checkIn.label, checkIn.index);
+        if (a >= 0) {
+          await this.activate(prev[a].cell);
+          await this.page.waitForTimeout(400);
+        }
+      }
 
-    await this.clickApply();
-    await expect(this.page.getByText('DD/MM/YYYY'), 'Dates were not applied (placeholder still shown)').toHaveCount(
-      0,
-      { timeout: 10_000 }
+      const live = await this.stableCells(1_500); // re-read: the list can shift after every click
+      if (live.length === 0) {
+        log.push('no enabled day cells left');
+        break;
+      }
+      const anchor = this.anchorIndex(live, checkIn.label, checkIn.index);
+      const offset = nights + attempt;
+      let target: DayCell;
+      if (anchor >= 0) {
+        const run = this.consecutiveRunLength(live, anchor);
+        if (offset > run) {
+          log.push(`stopped: only ${run} consecutive day(s) follow check-in day ${checkIn.label}`);
+          break;
+        }
+        target = live[anchor + offset];
+      } else {
+        target = live[Math.min(nights - 1 + attempt, live.length - 1)];
+        log.push(`check-in day ${checkIn.label} not found in the live list; using position ${nights - 1 + attempt}`);
+      }
+
+      await this.activate(target.cell);
+      const enabled = await this.applyEnabled(2_500);
+      log.push(`check-out attempt ${attempt + 1}: day ${target.label} (${offset} cells after check-in) -> Apply ${enabled ? 'enabled' : 'disabled'}`);
+      if (enabled) return { ok: true, log };
+    }
+    return { ok: false, log };
+  }
+
+  /**
+   * Selects check-in/check-out and applies. If a pass leaves Apply disabled, the
+   * page is reloaded and the whole selection is tried once more from a clean
+   * picker, because a half-finished range can leave the widget in a state that
+   * more clicks only make worse.
+   */
+  async selectStayDates(startOffset: number = 2, nights: number = 3) {
+    await this.ensureTallViewport();
+    const logs: string[] = [];
+    for (let pass = 1; pass <= 2; pass++) {
+      if (pass === 2) {
+        await this.page.reload();
+        await this.page.waitForTimeout(1000);
+        await this.dismissCookieBanner();
+      }
+      const result = await this.tryStayDates(startOffset, nights);
+      logs.push(`pass ${pass}:\n  ${result.log.join('\n  ')}`);
+      if (result.ok) {
+        await this.clickApply();
+        await expect(
+          this.page.getByText('DD/MM/YYYY'),
+          'Dates were not applied (placeholder still shown)'
+        ).toHaveCount(0, { timeout: 10_000 });
+        return;
+      }
+    }
+    throw new Error(
+      `Apply stayed disabled - the date range was not completed.\n${logs.join('\n')}\n${await this.describeCalendar()}`
     );
   }
 
@@ -297,7 +369,7 @@ export class PropertyPage extends BasePage {
   async openGuestsSelector() {
     await this.dismissCookieBanner();
     const trigger = this.page.getByText(/adults?/i).filter({ visible: true }).last();
-    await this.scrollToUpperViewport(trigger); // same reason as the dates picker: leave room for the popover
+    await this.scrollToUpperViewport(trigger);
     await this.safeClick(trigger);
   }
 
@@ -314,7 +386,6 @@ export class PropertyPage extends BasePage {
     await this.clickApply('guest selection');
   }
 
-  /** After dates/guests change, Search recalculates the price shown in Payment Summary. */
   async clickSearch() {
     await this.dismissCookieBanner();
     await this.safeClick(this.page.getByRole('button', { name: 'Search' }).filter({ visible: true }).first());
@@ -331,7 +402,6 @@ export class PropertyPage extends BasePage {
     expect(text).toMatch(/\d/);
   }
 
-  /** Clicking Book Now navigates to /reserve/property/<slug>?adult=N&from=M/D/YYYY&to=M/D/YYYY. */
   async clickBookNow() {
     await this.dismissCookieBanner();
     await this.safeClick(this.page.getByRole('button', { name: 'Book Now', exact: true }).filter({ visible: true }).first());
@@ -341,10 +411,6 @@ export class PropertyPage extends BasePage {
     await expect(this.page).toHaveURL(/\/reserve\/property\//, { timeout: 15_000 });
   }
 
-  /**
-   * Heart icon button sits next to "Share" and has no visible label.
-   * Try an accessible name first, then fall back to the sibling of Share.
-   */
   private wishlistToggle(): Locator {
     const byName = this.page.getByRole('button', { name: /wishlist|favou?rite/i }).filter({ visible: true }).first();
     const nextToShare = this.page

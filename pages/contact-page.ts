@@ -108,6 +108,32 @@ export class ContactPage extends BasePage {
     return (await captcha.count()) > 0;
   }
 
+  /**
+   * Everything the form needs before submitting, checked without submitting: the
+   * typed values are still in the fields, every required field is filled, and the
+   * Submit button is visible and enabled. Used where a CAPTCHA blocks the real
+   * submit, so the test still verifies the whole form up to that point.
+   */
+  async expectReadyToSubmit(details: { name: string; email: string; message: string }) {
+    await expect(this.nameField(), 'Name field lost its value').toHaveValue(details.name);
+    await expect(this.emailField(), 'Email field lost its value').toHaveValue(details.email);
+    await expect(this.messageField(), 'Message field lost its value').toHaveValue(details.message);
+
+    const required = this.page
+      .locator('input[required], input[aria-required="true"], select[required], textarea[required]')
+      .filter({ visible: true });
+    const count = await required.count();
+    for (let i = 0; i < count; i++) {
+      const el = required.nth(i);
+      const type = (await el.getAttribute('type').catch(() => null)) ?? 'text';
+      if (type === 'checkbox' || type === 'radio') continue;
+      expect(await el.inputValue().catch(() => 'x'), `Required field #${i + 1} is empty`).not.toBe('');
+    }
+
+    const submit = this.page.getByRole('button', { name: /submit|send/i }).filter({ visible: true }).last();
+    await expect(submit, 'Submit button is not visible/enabled').toBeEnabled();
+  }
+
   async submit() {
     await this.dismissCookieBanner();
     await this.safeClick(
