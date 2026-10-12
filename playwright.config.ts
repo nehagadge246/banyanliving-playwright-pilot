@@ -14,7 +14,7 @@ export default defineConfig({
   // The booking flows (dates -> guests -> price -> Book Now) take ~50s on the desktop
   // layout and longer on the tablet one, so 60s left no room: tests were being cut off
   // mid-click. This is a ceiling, not a delay - passing tests finish as soon as they are done.
-  timeout: 150_000,
+  timeout: 180_000,
   expect: { timeout: 10_000 },
   fullyParallel: true,
   retries: 1,

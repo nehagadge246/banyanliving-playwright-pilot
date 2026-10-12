@@ -202,22 +202,43 @@ export class PropertyPage extends BasePage {
    */
   private async dayStateKey(): Promise<string> {
     return this.page
-      .evaluate(() =>
-        Array.from(document.querySelectorAll('button'))
+      .evaluate(() => {
+        // On the tablet calendar the "selected" styling is not necessarily on the day button
+        // itself (it can sit on the wrapper cell), so the fingerprint covers the button, its
+        // two ancestors (every attribute) and any text on the page that mentions nights / dates.
+        const attrs = (e: Element | null) =>
+          e ? Array.from(e.attributes).map((a) => `${a.name}=${a.value}`).join(';') : '';
+        const cells = Array.from(document.querySelectorAll('button'))
           .filter((b) => /^\d{1,2}$/.test((b.textContent || '').trim()))
           .map((b) =>
             [
               (b.textContent || '').trim(),
-              b.getAttribute('class') || '',
-              b.getAttribute('aria-selected') || '',
-              b.getAttribute('aria-pressed') || '',
-              b.getAttribute('data-state') || '',
+              attrs(b),
+              attrs(b.parentElement),
+              attrs(b.parentElement ? b.parentElement.parentElement : null),
               (b as HTMLButtonElement).disabled ? 'd' : 'e',
             ].join('|')
-          )
-          .join('\n')
-      )
+          );
+        const lines = (document.body.innerText || '')
+          .split('\n')
+          .map((t) => t.trim())
+          .filter((t) => t.length < 90 && /\bnights?\b|check-?(in|out)|selected|[A-Za-z]{3} \d{1,2}, \d{4}/i.test(t))
+          .slice(0, 12);
+        return cells.join('\n') + '\n##' + lines.join('~');
+      })
       .catch(() => '');
+  }
+
+  /** Short description of what changed between two fingerprints (for the failure log). */
+  private describeChange(before: string, after: string): string {
+    if (before === after) return 'nothing changed';
+    const a = before.split('\n');
+    const b = after.split('\n');
+    const diffs: string[] = [];
+    for (let i = 0; i < Math.max(a.length, b.length) && diffs.length < 2; i++) {
+      if (a[i] !== b[i]) diffs.push(`[${(a[i] ?? '').slice(0, 110)}] -> [${(b[i] ?? '').slice(0, 110)}]`);
+    }
+    return diffs.join(' ; ');
   }
 
   /**
@@ -228,7 +249,7 @@ export class PropertyPage extends BasePage {
   private async clickCheckIn(
     startOffset: number,
     nights: number
-  ): Promise<{ label: string; index: number; registered: boolean }> {
+  ): Promise<{ label: string; index: number; registered: boolean; change: string }> {
     const before = await this.stableCells();
     const windowStart = this.findStayWindow(before, startOffset, nights);
     const index = windowStart >= 0 ? windowStart : Math.min(startOffset, before.length - 1);
@@ -245,7 +266,7 @@ export class PropertyPage extends BasePage {
       await this.page.waitForTimeout(500);
       registered = (await this.dayStateKey()) !== beforeKey;
     }
-    return { label: target.label, index, registered };
+    return { label: target.label, index, registered, change: this.describeChange(beforeKey, await this.dayStateKey()) };
   }
 
   /** Position of the check-in day in the live list (closest to where it was; the same number can appear in two months). */
@@ -329,7 +350,18 @@ export class PropertyPage extends BasePage {
     } catch (error) {
       throw new Error(`${(error as Error).message}\n${await this.describeCalendar()}`);
     }
-    await this.safeClick(await this.applyButton(scope));
+    // The Apply button can be re-rendered between finding it and clicking it (the tagged node then
+    // no longer exists): look it up again for each of up to 3 tries.
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await this.safeClick(await this.applyButton(scope));
+        return;
+      } catch (error) {
+        if (attempt === 3) throw error;
+        if (scope === 'calendar' && (await this.datesApplied(1_000))) return; // it applied after all
+        await this.page.waitForTimeout(500);
+      }
+    }
   }
 
   /** True once no visible "DD/MM/YYYY" placeholder is left (hidden duplicates of the control are ignored). */
@@ -342,6 +374,39 @@ export class PropertyPage extends BasePage {
     } catch {
       return false;
     }
+  }
+
+  /** Day-button fingerprint plus the dates control's text: changes when a click on a day registered. */
+  private async stateFingerprint(): Promise<string> {
+    const trigger = await this.datesTrigger()
+      .first()
+      .textContent({ timeout: 500 })
+      .catch(() => '');
+    return `${await this.dayStateKey()}##${trigger ?? ''}`;
+  }
+
+  /**
+   * Reads the applied range from the dates control (e.g. "DatesOct 13, 2026 - Oct 13, 2026Edit" on
+   * the tablet, "Check-In 13/10/2026 ... Check-Out" on desktop) and returns the number of nights, or
+   * null if two dates cannot be read. A same-day range (0 nights) is what produced "no price" and
+   * "The property requires a minimum stay of 3 night(s)" in the failing runs.
+   */
+  private async appliedRange(): Promise<{ text: string; nights: number | null }> {
+    const text = ((await this.datesTrigger().first().textContent({ timeout: 2_000 }).catch(() => '')) ?? '').trim();
+    const months = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+    const found: number[] = [];
+    const re = /([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2}),?\s+(\d{4})|(\d{1,2})\/(\d{1,2})\/(\d{4})/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text))) {
+      if (m[1]) {
+        const mi = months.indexOf(m[1].toLowerCase());
+        if (mi >= 0) found.push(Date.UTC(Number(m[3]), mi, Number(m[2])));
+      } else {
+        found.push(Date.UTC(Number(m[6]), Number(m[5]) - 1, Number(m[4])));
+      }
+    }
+    if (found.length < 2) return { text, nights: null };
+    return { text, nights: Math.round((found[1] - found[0]) / 86_400_000) };
   }
 
   /** Moment after which date selection gives up with a clear error instead of running into the test timeout. */
@@ -371,7 +436,7 @@ export class PropertyPage extends BasePage {
     await this.ensureStayWindow(startOffset, nights);
 
     const checkIn = await this.clickCheckIn(startOffset, nights);
-    log.push(`check-in: day ${checkIn.label} (list position ${checkIn.index}), click registered: ${checkIn.registered}`);
+    log.push(`check-in: day ${checkIn.label} (list position ${checkIn.index}), click registered: ${checkIn.registered} (${checkIn.change})`);
 
     for (let attempt = 0; attempt <= 6; attempt++) {
       await this.assertTimeLeft(log, `check-out attempt ${attempt + 1}`);
@@ -404,17 +469,24 @@ export class PropertyPage extends BasePage {
         log.push(`check-in day ${checkIn.label} not found in the live list; using position ${nights - 1 + attempt}`);
       }
 
-      // The first check-out day is tried with every kind of click (a click that did not
-      // register looks the same as a rejected range); later days with the default only.
+      // The first check-out day is tried with every kind of click, but only while the click had
+      // no visible effect: on the tablet Apply is already enabled after the check-in alone (a
+      // same-day range), so "Apply enabled" proves nothing. A check-out click counts only if it
+      // changed the calendar state, and a click that did register is never repeated on the same day.
       const modes: Array<'auto' | 'force' | 'key'> = attempt === 0 ? ['auto', 'force', 'key'] : ['auto'];
       for (const mode of modes) {
+        const before = await this.stateFingerprint();
         await this.activate(target.cell, mode).catch(() => {});
-        const enabled = await this.applyEnabled(2_500);
+        await this.page.waitForTimeout(500);
+        const afterFp = await this.stateFingerprint();
+        const registered = afterFp !== before;
+        const enabled = registered && (await this.applyEnabled(2_500));
         log.push(
           `check-out attempt ${attempt + 1}: day ${target.label} (${offset} cells after check-in), ` +
-            `${mode} click -> Apply ${enabled ? 'enabled' : 'disabled'}`
+            `${mode} click -> ${registered ? 'registered' : 'no effect'} (${registered ? this.describeChange(before, afterFp).slice(0, 160) : ''}), Apply ${enabled ? 'enabled' : 'disabled'}`
         );
         if (enabled) return { ok: true, log };
+        if (registered) break; // registered but rejected (e.g. minimum stay): move on to the next day
       }
     }
     return { ok: false, log };
@@ -450,11 +522,13 @@ export class PropertyPage extends BasePage {
             );
           }
         }
-        return;
+        const range = await this.appliedRange();
+        if (range.nights === null || range.nights >= nights) return;
+        logs.push(`  applied range "${range.text}" is ${range.nights} night(s), at least ${nights} needed - retrying`);
       }
     }
     throw new Error(
-      `Apply stayed disabled - the date range was not completed.\n${logs.join('\n')}\n${await this.describeCalendar()}`
+      `The date range was not completed (Apply stayed disabled, or a range shorter than ${nights} night(s) was applied).\n${logs.join('\n')}\n${await this.describeCalendar()}`
     );
   }
 
@@ -513,14 +587,59 @@ export class PropertyPage extends BasePage {
     await this.clickApply('guest selection');
   }
 
+  /**
+   * Desktop: a Search button recalculates the price after dates/guests change. The
+   * tablet layout has no such button (the tablet run showed none, only Book Now), so
+   * it presumably recalculates when Apply is pressed. If no Search button shows up
+   * within a few seconds, there is nothing to press and the price check that follows
+   * decides whether the price really appeared.
+   */
   async clickSearch() {
     await this.dismissCookieBanner();
-    await this.safeClick(this.page.getByRole('button', { name: 'Search' }).filter({ visible: true }).first());
+    const search = this.page.getByRole('button', { name: 'Search' }).filter({ visible: true }).first();
+    const present = await search
+      .waitFor({ state: 'visible', timeout: 5_000 })
+      .then(() => true)
+      .catch(() => false);
+    if (!present) return;
+    await this.safeClick(search);
   }
 
+  /**
+   * Waits for the "Total for N nights" text. If it is slow (the price is fetched
+   * after Search, and staging can take longer than 15s - that made the desktop test
+   * flaky), press Search once more if it is there and wait longer. On failure the
+   * error lists the price-related lines on the page, so a different wording on the
+   * tablet layout is visible at once.
+   */
   async getTotalPrice(): Promise<string> {
     const total = this.page.getByText(/total for \d+ nights?/i).filter({ visible: true }).first();
-    await total.waitFor({ state: 'visible', timeout: 15_000 });
+    try {
+      await total.waitFor({ state: 'visible', timeout: 12_000 });
+    } catch {
+      const search = this.page.getByRole('button', { name: 'Search' }).filter({ visible: true }).first();
+      if (await search.isVisible().catch(() => false)) {
+        await this.safeClick(search).catch(() => {});
+      }
+      try {
+        await total.waitFor({ state: 'visible', timeout: 25_000 });
+      } catch {
+        const lines = await this.page
+          .evaluate(() =>
+            (document.body.innerText || '')
+              .split('\n')
+              .map((s) => s.trim())
+              .filter((s) => /total|night|price|book/i.test(s))
+              .slice(0, 15)
+          )
+          .catch(() => [] as string[]);
+        throw new Error(
+          'The "Total for N nights" price did not appear.\n' +
+            `Price-related text on the page: ${JSON.stringify(lines)}\n` +
+            `Visible controls -> ${await this.describeVisibleControls()}`
+        );
+      }
+    }
     return (await total.locator('xpath=..').innerText()).trim();
   }
 
@@ -531,7 +650,20 @@ export class PropertyPage extends BasePage {
 
   async clickBookNow() {
     await this.dismissCookieBanner();
-    await this.safeClick(this.page.getByRole('button', { name: 'Book Now', exact: true }).filter({ visible: true }).first());
+    // The booking button reads "Book Now". A different, lower-case "Book now" control exists
+    // elsewhere on the page and leads to /search, so the exact spelling is preferred; only if it
+    // is absent is the case-insensitive match used, and then the LAST one (the booking widget
+    // comes after the header).
+    const exact = this.page.getByRole('button', { name: 'Book Now', exact: true }).filter({ visible: true });
+    const found = await exact
+      .first()
+      .waitFor({ state: 'visible', timeout: 10_000 })
+      .then(() => true)
+      .catch(() => false);
+    const target = found
+      ? exact.first()
+      : this.page.getByRole('button', { name: /^\s*book now\s*$/i }).filter({ visible: true }).last();
+    await this.safeClick(target);
   }
 
   async expectNavigatedToReserve() {

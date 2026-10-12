@@ -169,7 +169,7 @@ export class SearchPage extends BasePage {
     let suggestionFound = false;
     for (const candidate of suggestionCandidates) {
       try {
-        await candidate.waitFor({ state: 'visible', timeout: 4_000 });
+        await candidate.waitFor({ state: 'visible', timeout: 3_000 });
         await this.safeClick(candidate);
         suggestionFound = true;
         break;
@@ -182,12 +182,18 @@ export class SearchPage extends BasePage {
     }
 
     // A property page can take a while to load on staging, especially on the tablet profile.
-    if (await this.reachedPropertyPage(10_000)) return { reached: true, note: '' };
+    if (await this.reachedPropertyPage(20_000)) return { reached: true, note: '' };
+
+    // Selecting the suggestion only filled the box: submit what was typed.
+    if (await input.isVisible().catch(() => false)) {
+      await input.press('Enter').catch(() => {});
+      if (await this.reachedPropertyPage(8_000)) return { reached: true, note: '' };
+    }
 
     const searchButton = this.page.getByRole('button', { name: /^search$/i }).filter({ visible: true });
     if ((await searchButton.count()) > 0) {
       await this.safeClick(searchButton.first());
-      if (await this.reachedPropertyPage(15_000)) return { reached: true, note: '' };
+      if (await this.reachedPropertyPage(10_000)) return { reached: true, note: '' };
     }
 
     const card = this.page
@@ -197,7 +203,7 @@ export class SearchPage extends BasePage {
       .first();
     if ((await card.count()) > 0) {
       await this.safeClick(card);
-      if (await this.reachedPropertyPage(15_000)) return { reached: true, note: '' };
+      if (await this.reachedPropertyPage(10_000)) return { reached: true, note: '' };
     }
 
     return {
@@ -214,16 +220,26 @@ export class SearchPage extends BasePage {
    */
   async searchPropertyByName(name: string) {
     const notes: string[] = [];
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    // The test has 150s in all. Stop starting new tries when too little is left for one
+    // (a try needs up to ~45s), so the failure message comes from here, not from a timeout.
+    const budgetEnd = Date.now() + 140_000;
+    for (let attempt = 1; attempt <= 4; attempt++) {
       if (attempt > 1) {
+        if (budgetEnd - Date.now() < 45_000) {
+          notes.push(`try ${attempt}: not started (time budget used up)`);
+          break;
+        }
         await this.goto('/');
       }
-      const result = await this.attemptPropertySearch(name);
+      const result = await this.attemptPropertySearch(name).catch((e) => ({
+        reached: false,
+        note: `error: ${(e as Error).message.split('\n')[0]}`,
+      }));
       if (result.reached) return;
       notes.push(`try ${attempt}: ${result.note}`);
     }
     throw new Error(
-      `Searching for "${name}" did not reach a property page after 3 tries.\n${notes.join('\n')}\n` +
+      `Searching for "${name}" did not reach a property page.\n${notes.join('\n')}\n` +
         'Check test-failed-1.png: if the dropdown has no match, the property was renamed/removed on staging ' +
         '(update the test data); if it has one, the suggestion locator needs adjusting.'
     );
