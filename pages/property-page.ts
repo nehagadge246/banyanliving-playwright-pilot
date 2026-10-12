@@ -83,8 +83,20 @@ export class PropertyPage extends BasePage {
     }
   }
 
+  /**
+   * FIX: dayCellInfo() only scopes to an open dialog/popover when it can find one
+   * ([role="dialog"] or a radix popper wrapper). When the calendar on this page
+   * isn't wrapped that way, it falls back to querying enabled day buttons across
+   * the WHOLE page - which also picks up this site's hidden duplicate calendar for
+   * the other breakpoint (the same duplication the Dates/Guests triggers already
+   * work around elsewhere in this file via firstReachable()). Those extra cells
+   * were getting interleaved into the list, which corrupts every index-based
+   * lookup downstream (findStayWindow / anchorIndex / consecutiveRunLength) and
+   * was the likely cause of check-in/check-out landing on the wrong day. Filtering
+   * to `clickable` keeps only cells that are actually reachable on screen.
+   */
   private async cells(): Promise<DayCell[]> {
-    return this.dayCellInfo();
+    return (await this.dayCellInfo()).filter((c) => c.clickable);
   }
 
   /** Polls until the list of enabled days stops changing (the calendar re-renders after open / month change / click). */
@@ -102,6 +114,13 @@ export class PropertyPage extends BasePage {
     return cells;
   }
 
+  /**
+   * FIX: previously ended with `.first()`, so only one candidate ever reached
+   * ensureStayWindow() and it was clicked without checking it was actually
+   * reachable (same duplicate-breakpoint risk as the day cells above). Reachability
+   * is now resolved by the caller via firstReachable(), so this returns every
+   * matching candidate.
+   */
   private nextMonthButton(): Locator {
     const byName = this.page.getByRole('button', { name: /next month|go to next/i }).filter({ visible: true });
     const byClass = this.page
@@ -111,7 +130,7 @@ export class PropertyPage extends BasePage {
       .locator('[data-radix-popper-content-wrapper], [role="dialog"]')
       .getByRole('button', { name: /next/i })
       .filter({ visible: true });
-    return byName.or(byClass).or(inPopover).first();
+    return byName.or(byClass).or(inPopover);
   }
 
   private async describeGeometry(): Promise<string> {
@@ -181,8 +200,9 @@ export class PropertyPage extends BasePage {
       const cells = await this.stableCells();
       if (this.findStayWindow(cells, startOffset, nights) >= 0) return;
 
-      const next = this.nextMonthButton();
-      if ((await next.count()) === 0) break;
+      const candidates = this.nextMonthButton();
+      if ((await candidates.count()) === 0) break;
+      const next = await this.firstReachable(candidates);
       await this.activate(next);
       await this.page.waitForTimeout(400);
     }
@@ -291,23 +311,42 @@ export class PropertyPage extends BasePage {
    * closed sheet), so "the first visible Apply" can be the wrong one. This picks
    * the first Apply that is really on screen and not covered, falling back to the
    * first match.
+   *
+   * FIX: 'guests' used to fall into the 'any' branch below, which just grabs the
+   * first reachable "Apply" button ANYWHERE on the page - with no guarantee it's
+   * the guests panel's own Apply. If a stray reachable Apply existed elsewhere
+   * (e.g. a dates sheet that stays mounted on this tablet layout), confirmGuests()
+   * could click that one instead: it "succeeds" (no error), but the guests panel
+   * never actually closes. That is exactly what the tablet failures showed - a
+   * lingering visible "Apply" and two "Edit" buttons after the booking flow, no
+   * price, and a Book Now click that later failed because the page was still
+   * mid-transition. 'guests' now gets the same scoped lookup 'calendar' already
+   * had: walk up from the guest stepper's own "Increase value"/"Decrease value"
+   * button to find that panel's Apply, instead of guessing.
    */
-  private async applyButton(scope: 'calendar' | 'any' = 'any'): Promise<Locator> {
-    if (scope === 'calendar') {
+  private async applyButton(scope: 'calendar' | 'guests' | 'any' = 'any'): Promise<Locator> {
+    if (scope === 'calendar' || scope === 'guests') {
       // The page can hold several Apply buttons (the tablet layout's sheet, the
-      // guests panel). The one that matters for the dates is the one in the same
-      // panel as the day cells: walk up from a visible day cell to the nearest
-      // container that holds an Apply button and tag that button.
+      // guests panel). Walk up from an element that only exists inside the panel
+      // we actually care about - a day cell for 'calendar', the guest stepper for
+      // 'guests' - to the nearest container that holds an Apply button, and tag it.
+      const anchorIsCalendar = scope === 'calendar';
       const tagged = await this.page
-        .evaluate(() => {
+        .evaluate((anchorIsCalendar) => {
           document.querySelectorAll('[data-pw-apply]').forEach((e) => e.removeAttribute('data-pw-apply'));
-          const day = Array.from(document.querySelectorAll('button')).find(
-            (b) =>
-              /^\d{1,2}$/.test((b.textContent || '').trim()) &&
-              !(b as HTMLButtonElement).disabled &&
-              b.getBoundingClientRect().width > 0
-          );
-          let node: Element | null = day || null;
+          const anchor = anchorIsCalendar
+            ? Array.from(document.querySelectorAll('button')).find(
+                (b) =>
+                  /^\d{1,2}$/.test((b.textContent || '').trim()) &&
+                  !(b as HTMLButtonElement).disabled &&
+                  b.getBoundingClientRect().width > 0
+              )
+            : Array.from(document.querySelectorAll('button')).find(
+                (b) =>
+                  /^(increase|decrease) value$/i.test((b.textContent || b.getAttribute('aria-label') || '').trim()) &&
+                  b.getBoundingClientRect().width > 0
+              );
+          let node: Element | null = anchor || null;
           while (node) {
             const apply = Array.from(node.querySelectorAll('button')).find((b) =>
               /^\s*apply\s*$/i.test(b.textContent || '')
@@ -319,14 +358,14 @@ export class PropertyPage extends BasePage {
             node = node.parentElement;
           }
           return false;
-        })
+        }, anchorIsCalendar)
         .catch(() => false);
       if (tagged) return this.page.locator('[data-pw-apply="1"]').first();
     }
     return this.firstReachable(this.page.getByRole('button', { name: 'Apply' }).filter({ visible: true }));
   }
 
-  private async applyEnabled(timeout: number, scope: 'calendar' | 'any' = 'calendar'): Promise<boolean> {
+  private async applyEnabled(timeout: number, scope: 'calendar' | 'guests' | 'any' = 'calendar'): Promise<boolean> {
     try {
       await expect
         .poll(async () => (await this.applyButton(scope)).isEnabled().catch(() => false), { timeout })
@@ -339,7 +378,7 @@ export class PropertyPage extends BasePage {
 
   private async clickApply(what: string = 'date range') {
     await this.dismissCookieBanner();
-    const scope = what === 'date range' ? 'calendar' : 'any';
+    const scope = what === 'date range' ? 'calendar' : what === 'guest selection' ? 'guests' : 'any';
     try {
       await expect
         .poll(async () => (await this.applyButton(scope)).isEnabled().catch(() => false), {
@@ -361,6 +400,25 @@ export class PropertyPage extends BasePage {
         if (scope === 'calendar' && (await this.datesApplied(1_000))) return; // it applied after all
         await this.page.waitForTimeout(500);
       }
+    }
+  }
+
+  /**
+   * True once the guests panel's own stepper is gone, i.e. the panel actually
+   * closed. confirmGuests() previously had no equivalent check (unlike dates'
+   * datesApplied()), so a guests Apply click that silently missed its target
+   * went unnoticed until the price check failed much later with no clear cause.
+   */
+  private async guestsApplied(timeout: number): Promise<boolean> {
+    try {
+      await expect
+        .poll(async () => this.page.getByRole('button', { name: 'Increase value' }).filter({ visible: true }).count(), {
+          timeout,
+        })
+        .toBe(0);
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -552,11 +610,17 @@ export class PropertyPage extends BasePage {
    * plain "Edit" buttons one by one until the panel (its "Increase value" button)
    * appears. The dates control is named "Dates ... Edit", so it is not matched by
    * the exact "Edit" name.
+   *
+   * FIX: this used to grab the `.last()` "Adults" text match, with no reachability
+   * check - the same duplicate-breakpoint hazard as the calendar cells above. Now
+   * resolved through firstReachable(), matching how every other trigger in this
+   * file (datesTrigger, applyButton) is already resolved.
    */
   async openGuestsSelector() {
     await this.dismissCookieBanner();
-    const trigger = this.page.getByText(/adults?/i).filter({ visible: true }).last();
-    if ((await trigger.count()) > 0) {
+    const candidates = this.page.getByText(/adults?/i).filter({ visible: true });
+    if ((await candidates.count()) > 0) {
+      const trigger = await this.firstReachable(candidates);
       await this.scrollToUpperViewport(trigger);
       await this.safeClick(trigger);
       if (await this.guestsPanelOpen(2_500)) return;
@@ -585,6 +649,18 @@ export class PropertyPage extends BasePage {
 
   async confirmGuests() {
     await this.clickApply('guest selection');
+    if (!(await this.guestsApplied(6_000))) {
+      // The Apply click may have landed on the wrong (already-enabled) Apply
+      // button elsewhere on the page instead of the guests panel's own - press
+      // the correctly-scoped one once more before failing.
+      await this.activate(await this.applyButton('guests'), 'dom').catch(() => {});
+      if (!(await this.guestsApplied(6_000))) {
+        throw new Error(
+          'Guests were not applied (the guest stepper is still open after pressing Apply).\n' +
+            `Visible controls -> ${await this.describeVisibleControls()}`
+        );
+      }
+    }
   }
 
   /**
@@ -595,6 +671,7 @@ export class PropertyPage extends BasePage {
    * decides whether the price really appeared.
    */
   async clickSearch() {
+    await this.closeAnyOpenPanel();
     await this.dismissCookieBanner();
     const search = this.page.getByRole('button', { name: 'Search' }).filter({ visible: true }).first();
     const present = await search
@@ -648,7 +725,25 @@ export class PropertyPage extends BasePage {
     expect(text).toMatch(/\d/);
   }
 
+  /**
+   * If a date/guests panel is still open (its Apply button is visible and
+   * reachable), press Apply to close it before interacting with anything else.
+   * A lingering open panel - specifically the guests panel not closing, see the
+   * applyButton()/confirmGuests() fix above - is what left the page mid-transition
+   * right when Book Now was clicked in the failing tablet run, which is the most
+   * likely reason the exact "Book Now" button wasn't found within its wait and the
+   * regex fallback target then disappeared mid-click.
+   */
+  private async closeAnyOpenPanel() {
+    const apply = this.page.getByRole('button', { name: /^apply$/i }).filter({ visible: true }).first();
+    if (await apply.isVisible().catch(() => false)) {
+      await this.safeClick(apply).catch(() => {});
+      await this.page.waitForTimeout(300);
+    }
+  }
+
   async clickBookNow() {
+    await this.closeAnyOpenPanel();
     await this.dismissCookieBanner();
     // The booking button reads "Book Now". A different, lower-case "Book now" control exists
     // elsewhere on the page and leads to /search, so the exact spelling is preferred; only if it
@@ -657,7 +752,7 @@ export class PropertyPage extends BasePage {
     const exact = this.page.getByRole('button', { name: 'Book Now', exact: true }).filter({ visible: true });
     const found = await exact
       .first()
-      .waitFor({ state: 'visible', timeout: 10_000 })
+      .waitFor({ state: 'visible', timeout: 15_000 })
       .then(() => true)
       .catch(() => false);
     const target = found
